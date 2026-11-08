@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.python-version
+
+# --- app data (runtime) ---
+data/
+*.db
+*.db-wal
+*.db-shm
+*.wav.tmp
+
+# --- frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+*.tsbuildinfo
+# 前端构建产物（pnpm build 输出，克隆后用 pnpm build 重新生成）
+src/qwen_tts_studio/static/
+
+# --- editors / OS ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# --- local model artifacts ---
+models/
+*.gguf
+*.spk
+*.rvq
+
+.workbuddy

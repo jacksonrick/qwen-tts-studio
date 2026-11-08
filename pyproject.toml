@@ -1,0 +1,26 @@
+[project]
+name = "qwen-tts-studio"
+version = "0.1.0"
+description = "本地运行的多模式语音合成工作台（Qwen3-TTS）：声音设计 / 音色克隆 / 语音生成"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "faster-qwen3-tts>=0.5.0",
+    "numpy>=1.26",
+    "python-multipart>=0.0.7",
+    "sounddevice>=0.5.6",
+    "soundfile>=0.12",
+    "uvicorn[standard]>=0.30",
+]
+
+[project.scripts]
+qwen-tts-studio = "qwen_tts_studio:main"
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[build-system]
+requires = ["uv_build>=0.13.5,<0.14.0"]
+build-backend = "uv_build"
