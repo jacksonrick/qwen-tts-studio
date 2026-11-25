@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import time
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,66 @@ async def list_history(
 ) -> dict[str, Any]:
     studio = state(request)
     return studio.history.list(page=page, page_size=page_size, mode=mode, status=status, query=query)
+
+
+def _older_than(before: int) -> int:
+    """Only allow cutting strictly into the past, so a bad timestamp cannot wipe new records."""
+    if before <= 0 or before > time.time() - 60:
+        raise HTTPException(status_code=400, detail="before 必须是 1 分钟以前的 Unix 时间戳")
+    return before
+
+
+@router.get("/history/preview", dependencies=[Depends(require_auth)])
+async def preview_cleanup(request: Request, before: int = Query(..., ge=0)) -> dict[str, Any]:
+    """How many records (and how much disk) a cleanup would remove."""
+    studio = state(request)
+    rows = studio.history.pending_before(_older_than(before))
+    audio_files = 0
+    audio_bytes = 0
+    for row in rows:
+        path = row.get("audio_path")
+        if not path:
+            continue
+        audio_files += 1
+        with contextlib.suppress(OSError):
+            audio_bytes += Path(path).stat().st_size
+    return {
+        "before": before,
+        "records": len(rows),
+        "audio_files": audio_files,
+        "audio_bytes": audio_bytes,
+        "oldest": rows[0]["created_at"] if rows else None,
+        "newest": rows[-1]["created_at"] if rows else None,
+    }
+
+
+@router.delete("/history", dependencies=[Depends(require_auth)])
+async def cleanup_history(request: Request, before: int = Query(..., ge=0)) -> dict[str, Any]:
+    """Bulk delete: remove every record older than `before`, including its audio file."""
+    studio = state(request)
+    rows = studio.history.delete_before(_older_than(before))
+    audio_removed = 0
+    freed_bytes = 0
+    folders: set[Path] = set()
+    for row in rows:
+        path = row.get("audio_path")
+        if not path:
+            continue
+        file = Path(path)
+        with contextlib.suppress(OSError):
+            freed_bytes += file.stat().st_size
+        try:
+            file.unlink()
+            audio_removed += 1
+            folders.add(file.parent)
+        except OSError:
+            pass
+    # 顺手清掉空的 年/月/日 目录，避免 audio 下留一堆空壳
+    for folder in sorted(folders, key=lambda item: len(item.parts), reverse=True):
+        for candidate in (folder, folder.parent, folder.parent.parent):
+            with contextlib.suppress(OSError):
+                candidate.rmdir()
+    return {"deleted": len(rows), "audio_removed": audio_removed, "freed_bytes": freed_bytes}
 
 
 @router.get("/history/{record_id}", dependencies=[Depends(require_auth)])
@@ -129,6 +191,7 @@ async def regenerate(request: Request, record_id: str, overrides: dict[str, Any]
         voice_id=voice_id,
     )
     result = await job.done
+    job.release_result()
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
     return Response(

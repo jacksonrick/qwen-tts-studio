@@ -85,6 +85,9 @@ export function useTts() {
   const playerRef = useRef<PcmPlayer | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const statusRef = useRef<StreamStatus>("idle");
+  // 每次开始/停止都自增：停止之后，取消前仍在途的消息一律丢弃，
+  // 否则它们会重新把音频塞进播放器，还会把「已取消」改回「已完成」。
+  const genRef = useRef(0);
 
   const setBoth = useCallback((next: StreamStatus) => {
     statusRef.current = next;
@@ -108,6 +111,7 @@ export function useTts() {
   }, []);
 
   const reset = useCallback(() => {
+    genRef.current += 1;
     void cleanup();
     setBoth("idle");
     setMetrics({ audioSeconds: 0, chunks: 0 });
@@ -117,11 +121,25 @@ export function useTts() {
   }, [cleanup, setBoth]);
 
   const stop = useCallback(() => {
+    genRef.current += 1;
     const ws = wsRef.current;
+    wsRef.current = null;
     if (ws && ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify({ type: "cancel" }));
+      try {
+        ws.send(JSON.stringify({ type: "cancel" }));
+      } catch {
+        /* 连接已经断了 */
+      }
+    }
+    if (ws && ws.readyState <= WebSocket.OPEN) {
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
     }
     abortRef.current?.abort();
+    abortRef.current = null;
     playerRef.current?.stop();
     setBoth("cancelled");
   }, [setBoth]);
@@ -129,6 +147,7 @@ export function useTts() {
   const start = useCallback(
     async (request: SpeechRequest, options?: { streaming?: boolean }) => {
       if (ACTIVE.includes(statusRef.current)) return;
+      const gen = ++genRef.current;
       await cleanup();
       setError(null);
       setResult(null);
@@ -154,6 +173,7 @@ export function useTts() {
             throw new ApiError(detail?.message ?? "生成失败", detail?.code ?? "generation_failed", response.status, detail?.hint);
           }
           const blob = await response.blob();
+          if (gen !== genRef.current) return;
           const historyId = response.headers.get("X-History-Id") ?? "";
           const duration = Number(response.headers.get("X-Duration") ?? 0);
           const ttfa = Number(response.headers.get("X-Ttfa-Ms") ?? 0);
@@ -165,6 +185,8 @@ export function useTts() {
           const audio = new Audio(URL.createObjectURL(blob));
           void audio.play().catch(() => undefined);
         } catch (err) {
+          // 已经被停止/重开过，这次结果作废，不要覆盖当前状态
+          if (gen !== genRef.current) return;
           if ((err as Error).name === "AbortError") {
             setBoth("idle");
             return;
@@ -190,10 +212,15 @@ export function useTts() {
       wsRef.current = ws;
 
       ws.onopen = () => {
+        if (gen !== genRef.current) {
+          ws.close();
+          return;
+        }
         ws.send(JSON.stringify({ type: "start", request }));
       };
 
       ws.onmessage = (event) => {
+        if (gen !== genRef.current) return;
         if (typeof event.data !== "string") {
           const buffer = event.data as ArrayBuffer;
           player.push(buffer);
@@ -249,6 +276,7 @@ export function useTts() {
           }
         } else if (type === "done") {
           const audioUrl = payload.audio_url as string | null;
+          const cancelled = Boolean(payload.cancelled);
           setResult({
             recordId: payload.record_id as string | undefined,
             audioUrl: audioUrl ?? undefined,
@@ -259,7 +287,8 @@ export function useTts() {
             chunks: Number(payload.chunks ?? 0),
           });
           setMetrics((prev) => ({ ...prev, ttfaMs: Number(payload.ttfa_ms ?? 0), rtf: payload.rtf as number | undefined }));
-          setBoth("done");
+          // 服务端可能把「已取消」也作为 done 下发（带 cancelled 标记），别显示成已完成
+          setBoth(cancelled ? "cancelled" : "done");
           ws.close();
         } else if (type === "error") {
           setError({ code: String(payload.code ?? "error"), message: String(payload.message ?? "生成失败"), hint: payload.hint as string });
@@ -272,11 +301,13 @@ export function useTts() {
       };
 
       ws.onerror = () => {
+        if (gen !== genRef.current) return;
         setError({ code: "socket_error", message: "与后端的连接中断", hint: "确认后端仍在运行，然后重试" });
         setBoth("error");
       };
 
       ws.onclose = () => {
+        if (gen !== genRef.current) return;
         if (statusRef.current === "streaming" || statusRef.current === "loading" || statusRef.current === "queued") {
           setBoth("cancelled");
         }

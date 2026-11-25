@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import queue
 import threading
@@ -22,6 +23,10 @@ from .manager import ModelManager
 
 logger = logging.getLogger(__name__)
 
+# 每个任务最多缓存多少条待下发事件（音频帧 + 统计）。超过说明下游没在读，
+# 继续堆积只会把 PCM 留在内存里，因此直接判定客户端过慢并终止任务。
+EVENT_QUEUE_MAX = 96
+
 
 class JobCancelled(Exception):
     pass
@@ -38,19 +43,63 @@ class Job:
     streaming: bool = True
     status: str = "queued"
     cancel_event: threading.Event = field(default_factory=threading.Event)
-    events: asyncio.Queue = field(default_factory=asyncio.Queue)
+    events: asyncio.Queue = field(default_factory=lambda: asyncio.Queue(maxsize=EVENT_QUEUE_MAX))
     done: asyncio.Future | None = None
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
     record_id: str | None = None
     error: dict[str, Any] | None = None
+    overflow: bool = False
 
     def emit(self, event: dict[str, Any]) -> None:
         try:
-            self.loop.call_soon_threadsafe(self.events.put_nowait, event)
+            self.loop.call_soon_threadsafe(self._push, event)
         except RuntimeError:
             pass
+
+    def _push(self, event: dict[str, Any]) -> None:
+        """Runs on the event loop thread; bounded so a stalled consumer cannot eat RAM."""
+        if self.overflow:
+            # 已经判定客户端过慢：音频与统计再进来也没人听，只放行终态事件
+            if event.get("type") in {"audio", "stats"}:
+                return
+        try:
+            self.events.put_nowait(event)
+        except asyncio.QueueFull:
+            self._abort_overflow()
+
+    def _abort_overflow(self) -> None:
+        if self.overflow:
+            return
+        self.overflow = True
+        self.cancel_event.set()
+        # 丢掉积压的 PCM，换成一条明确的错误，让客户端立刻知道发生了什么
+        while True:
+            try:
+                self.events.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        with contextlib.suppress(asyncio.QueueFull):
+            self.events.put_nowait(
+                {
+                    "type": "error",
+                    "code": "client_too_slow",
+                    "message": "下游读取音频太慢，已终止本次生成",
+                    "hint": "降低流式分段大小、检查网络，或改用非流式接口",
+                }
+            )
+
+    def drain_events(self) -> None:
+        while True:
+            try:
+                self.events.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    def release_result(self) -> None:
+        """Drop the finished result (it holds the whole waveform) once the caller copied it."""
+        self.done = None
 
     def emit_audio(self, data: bytes, index: int, audio_seconds: float) -> None:
         self.emit({"type": "audio", "data": data, "index": index, "audio_s": audio_seconds})
@@ -132,6 +181,9 @@ class JobRunner:
                 for old_id, old in list(self._jobs.items())[:-64]:
                     if old.status in {"done", "error", "cancelled"}:
                         self._jobs.pop(old_id, None)
+                        # 已完成任务的事件队列可能还压着没人读的 PCM，一并释放
+                        old.drain_events()
+                        old.done = None
         try:
             self._queue.put_nowait(job)
         except queue.Full as exc:
@@ -263,10 +315,19 @@ class JobRunner:
         audio = concat(collected) if collected else np.zeros(0, dtype=np.float32)
         total_seconds = audio_duration(audio, sample_rate)
 
+        if error is None and job.overflow:
+            error = {
+                "code": "client_too_slow",
+                "message": "下游读取音频太慢，已终止本次生成",
+                "hint": "降低流式分段大小、检查网络，或改用非流式接口",
+            }
+
         if error is not None:
             job.status = "error"
             job.error = error
-            job.emit({"type": "error", **error})
+            # 背压场景下客户端已经收到过 client_too_slow，不用再重复发一条
+            if not job.overflow:
+                job.emit({"type": "error", **error})
         elif cancelled and total_seconds <= 0.05:
             job.status = "cancelled"
             job.emit({"type": "cancelled", "job_id": job.id})
@@ -354,7 +415,8 @@ class JobRunner:
                         "rtf": _rtf(total_seconds, gen_started or started),
                         "sample_rate": sample_rate,
                         "chunks": chunk_count,
-                        "audio": audio,
+                        # 流式任务的声音已经逐帧下发，没必要再把整段波形挂在 Future 上占内存
+                        "audio": audio if not job.streaming else None,
                     },
                 )
             except RuntimeError:

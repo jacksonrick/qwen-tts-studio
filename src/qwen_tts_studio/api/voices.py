@@ -11,7 +11,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, Response
 
-from ..engine.audio import read_audio, wav_bytes, write_wav
+from ..engine.audio import fit_text_to_seconds, limit_seconds, read_audio, wav_bytes, write_wav
 from ..engine.base import EngineError
 from .deps import require_auth, state
 from .schemas import SpeakRequest, VoiceUpdate
@@ -53,6 +53,12 @@ async def create_voice(
     if suffix and suffix not in ALLOWED_SUFFIXES:
         raise HTTPException(status_code=400, detail=f"不支持的音频格式：{suffix}")
 
+    # ggml 后端的克隆接口没有风格指令参数：存下来只会在之后每次试听/克隆时报错
+    instruct_text = (instruct or "").strip()
+    instruct_ignored = bool(instruct_text) and studio.manager.backend == "ggml"
+    if instruct_ignored:
+        instruct_text = ""
+
     voice_id = uuid.uuid4().hex[:12]
     folder = studio.paths.voices / voice_id
     folder.mkdir(parents=True, exist_ok=True)
@@ -81,10 +87,16 @@ async def create_voice(
         shutil.rmtree(folder, ignore_errors=True)
         raise HTTPException(status_code=400, detail="音频为空")
 
+    full_seconds = audio.size / 24000.0
+    # 在 30 秒前的一小段里挑能量最低的点收尾，避免把字切一半（ICL 会先把那半个音补完）。
+    audio, truncated = limit_seconds(audio, MAX_REF_SECONDS, 24000)
     seconds = audio.size / 24000.0
-    if seconds > MAX_REF_SECONDS:
-        audio = audio[: int(MAX_REF_SECONDS * 24000)]
-        seconds = MAX_REF_SECONDS
+
+    # ICL 克隆要求参考文本与参考音频严格对应：音频被截断时，文本也要收敛到
+    # 这段音频真正能容纳的长度，否则模型会把参考音频当上下文接着往下说。
+    original_ref_text = (ref_text or "").strip()
+    ref_text = fit_text_to_seconds(original_ref_text, seconds)
+    ref_text_trimmed = ref_text != original_ref_text
 
     wav_path = folder / "ref.wav"
     write_wav(wav_path, audio, 24000)
@@ -102,7 +114,7 @@ async def create_voice(
         "kind": "clone",
         "language": language,
         "ref_text": ref_text.strip(),
-        "instruct": instruct.strip(),
+        "instruct": instruct_text,
         "xvec_only": xvec_only,
         "tags": [str(tag) for tag in tag_list][:12],
         "color": color or None,
@@ -120,7 +132,15 @@ async def create_voice(
         prepared = {"supported": False, "reason": str(exc)}
 
     voice = studio.voices.get(voice_id)
-    return {"voice": voice, "duration_s": round(seconds, 2), "prepared": prepared}
+    return {
+        "voice": voice,
+        "duration_s": round(seconds, 2),
+        "source_duration_s": round(full_seconds, 2),
+        "truncated": truncated,
+        "ref_text_trimmed": ref_text_trimmed,
+        "instruct_ignored": instruct_ignored,
+        "prepared": prepared,
+    }
 
 
 @router.get("/voices/{voice_id}", dependencies=[Depends(require_auth)])
@@ -136,7 +156,11 @@ async def update_voice(request: Request, voice_id: str, payload: VoiceUpdate) ->
     studio = state(request)
     if not studio.voices.get(voice_id):
         raise HTTPException(status_code=404, detail="voice not found")
-    updated = studio.voices.update(voice_id, **payload.model_dump(exclude_none=True))
+    patch = payload.model_dump(exclude_none=True)
+    if "instruct" in patch and studio.manager.backend == "ggml":
+        # ggml 克隆不支持风格指令，存进去会让这个音色之后每次合成都失败
+        patch["instruct"] = ""
+    updated = studio.voices.update(voice_id, **patch)
     return updated or {}
 
 
@@ -204,6 +228,8 @@ async def sample_voice(request: Request, voice_id: str, payload: SpeakRequest) -
         voice_id=voice_id,
         ref_text=voice.get("ref_text") or "",
         instruct=voice.get("instruct") or "",
+        # 音色本身是 x-vector 模式时，试听也必须走同一路径，否则会拿空 ref_text 做 ICL。
+        xvec_only=bool(voice.get("xvec_only")),
     )
     try:
         params, model_id, resolved_voice = studio.resolve(speech)
@@ -217,6 +243,7 @@ async def sample_voice(request: Request, voice_id: str, payload: SpeakRequest) -
         voice_id=resolved_voice,
     )
     result = await job.done
+    job.release_result()
     if result.get("error"):
         raise HTTPException(status_code=500, detail=result["error"])
     data = wav_bytes(result["audio"], result.get("sample_rate") or 24000)

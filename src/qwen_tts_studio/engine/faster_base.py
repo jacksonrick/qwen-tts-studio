@@ -158,11 +158,12 @@ class FasterGGMLEngine(FasterEngine):
         return getattr(self.model, "runtime", None)
 
     def _clone_kwargs(self, params: GenParams) -> dict[str, Any]:
-        if (params.instruct or "").strip():
+        # ggml 的克隆接口没有 instruct 参数；忽略而不是让整次请求失败
+        if params.xvec_only and (params.ref_spk or params.ref_rvq):
             raise EngineError(
-                "ggml 后端不支持克隆时的风格指令",
+                "x-vector 模式不能使用缓存的音色特征",
                 "unsupported_parameter",
-                "清空 instruct，或将后端切换为 torch",
+                "改用参考音频，或关闭「仅用说话人特征」走 ICL 克隆",
             )
         kwargs: dict[str, Any] = {
             "text": params.text.strip(),

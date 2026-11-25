@@ -11,7 +11,7 @@ import {
   Waves,
   Zap,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/Shell";
@@ -85,13 +85,17 @@ export default function GeneratePage() {
     localStorage.setItem("qts_language", language);
   }, [language]);
 
+  // info 是全局 query，窗口重新聚焦会 refetch。高级参数只在首次拿到设置时初始化一次，
+  // 否则用户手动改过的值会被后台刷新悄悄重置。
+  const settingsApplied = useRef(false);
   useEffect(() => {
-    if (!info) return;
-    setChunkSize((prev) => (prev === 8 ? info.settings.chunk_size : prev));
-    setTemperature((prev) => (prev === 0.9 ? info.settings.temperature : prev));
-    setTopK((prev) => (prev === 50 ? info.settings.top_k : prev));
-    setTopP((prev) => (prev === 1 ? info.settings.top_p : prev));
-    setRepetitionPenalty((prev) => (prev === 1.05 ? info.settings.repetition_penalty : prev));
+    if (!info || settingsApplied.current) return;
+    settingsApplied.current = true;
+    setChunkSize(info.settings.chunk_size);
+    setTemperature(info.settings.temperature);
+    setTopK(info.settings.top_k);
+    setTopP(info.settings.top_p);
+    setRepetitionPenalty(info.settings.repetition_penalty);
     setAppendSilence(info.settings.append_silence);
   }, [info]);
 
@@ -115,7 +119,8 @@ export default function GeneratePage() {
     text: text.trim(),
     language,
     speaker: mode === "custom" ? speaker : undefined,
-    instruct: mode === "design" || mode === "custom" ? instruct.trim() : "",
+    // ggml 后端的克隆模式不接受风格指令，禁用时不要把它带上去
+    instruct: mode === "clone" && cloneInstructDisabled ? "" : instruct.trim(),
     voice_id: mode === "clone" ? voiceId : null,
     xvec_only: xvecOnly,
     temperature,
@@ -161,8 +166,14 @@ export default function GeneratePage() {
       form.append("instruct", instruct.trim());
       form.append("xvec_only", String(xvecOnly));
       form.append("source_history_id", tts.result.recordId ?? "");
-      await api.createVoice(form);
-      toast.success("已存入音色库");
+      const result = await api.createVoice(form);
+      if (result.instruct_ignored) {
+        toast.warning("已存入音色库（ggml 后端克隆不支持风格指令，已忽略）");
+      } else {
+        toast.success(
+          result.truncated ? "已存入音色库（参考音频截为前 30 秒，参考文本同步截断）" : "已存入音色库",
+        );
+      }
       setSaveOpen(false);
       setVoiceName("");
       await queryClient.invalidateQueries({ queryKey: ["voices"] });
@@ -295,7 +306,9 @@ export default function GeneratePage() {
                 <div className="flex items-center justify-between rounded-lg border border-border/70 bg-muted/20 px-3 py-2">
                   <div>
                     <Label>仅用说话人特征</Label>
-                    <p className="mt-0.5 text-[10px] text-muted-foreground">x-vector 模式，跨语言更干净，不需参考文本</p>
+                    <p className="mt-0.5 text-[10px] text-muted-foreground">
+                      x-vector 模式，不依赖参考文本，跨语言更干净，也不会复读参考内容
+                    </p>
                   </div>
                   <Switch checked={xvecOnly} onCheckedChange={setXvecOnly} />
                 </div>
@@ -493,7 +506,8 @@ export default function GeneratePage() {
           <Input value={voiceName} onChange={(event) => setVoiceName(event.target.value)} placeholder="例如：纪录片男声 v1" />
         </Field>
         <p className="text-[11px] leading-relaxed text-muted-foreground">
-          参考文本会使用当前输入的内容，克隆质量依赖这段文本与音频是否严格对应。
+          参考文本取当前输入的全文。生成音频超过 30 秒时会截取前 30 秒，参考文本自动收敛到这段音频对应的长度，
+          保证文本与音频严格对应（ICL 克隆对不齐就会复读参考内容）。
         </p>
       </Dialog>
     </div>

@@ -60,6 +60,7 @@ async def get_job(request: Request, job_id: str) -> dict[str, Any]:
         "record_id": job.record_id,
         "error": job.error,
         "streaming": job.streaming,
+        "overflow": job.overflow,
     }
 
 
@@ -89,6 +90,8 @@ async def synthesize(request: Request, payload: SpeechRequest) -> Response:
         studio.runner.cancel(job.id)
         raise HTTPException(status_code=504, detail="generation timed out") from exc
 
+    # 结果已拿到手，及时松开 Future，避免整段波形随任务对象一直留在内存里
+    job.release_result()
     if result.get("error"):
         error = result["error"]
         raise HTTPException(status_code=500, detail=error)

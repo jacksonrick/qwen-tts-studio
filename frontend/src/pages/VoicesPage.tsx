@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Loader2, Mic, Play, Sparkles, Trash2, Upload, Wand2 } from "lucide-react";
+import { Download, Loader2, Mic, Pencil, Play, Sparkles, Trash2, Upload, Wand2 } from "lucide-react";
 import { useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -27,6 +27,9 @@ export default function VoicesPage() {
   const [busy, setBusy] = useState(false);
   const [playing, setPlaying] = useState<string | null>(null);
   const [preparing, setPreparing] = useState<string | null>(null);
+  const [editTarget, setEditTarget] = useState<Voice | null>(null);
+  const [editRefText, setEditRefText] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
   const recorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -96,7 +99,11 @@ export default function VoicesPage() {
       form.append("language", language);
       form.append("xvec_only", String(xvecOnly));
       const result = await api.createVoice(form);
-      toast.success(`已保存（参考音频 ${result.duration_s}s）`);
+      const notes = [`参考音频 ${result.duration_s}s`];
+      if (result.truncated) notes.push("超过 30 秒已截断，参考文本同步截到对应位置");
+      else if (result.ref_text_trimmed) notes.push("参考文本已按音频长度自动收敛");
+      if (result.instruct_ignored) notes.push("当前后端克隆不支持风格指令，已忽略");
+      toast.success(`已保存（${notes.join("；")}）`);
       setUploadOpen(false);
       setFile(null);
       setName("");
@@ -134,6 +141,26 @@ export default function VoicesPage() {
       toast.error(error instanceof Error ? error.message : "提取失败");
     } finally {
       setPreparing(null);
+    }
+  };
+
+  const openEdit = (voice: Voice) => {
+    setEditTarget(voice);
+    setEditRefText(voice.ref_text ?? "");
+  };
+
+  const saveRefText = async () => {
+    if (!editTarget) return;
+    setSavingEdit(true);
+    try {
+      await api.updateVoice(editTarget.id, { ref_text: editRefText.trim() });
+      toast.success("参考文本已更新");
+      setEditTarget(null);
+      await refresh();
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "更新失败");
+    } finally {
+      setSavingEdit(false);
     }
   };
 
@@ -182,7 +209,10 @@ export default function VoicesPage() {
                     <div className="min-w-0">
                       <CardTitle className="truncate">{voice.name}</CardTitle>
                       <CardDescription>
-                        {voice.language ?? "Auto"} · {voice.ref_text ? `${voice.ref_text.slice(0, 18)}…` : "无参考文本"}
+                        {voice.language ?? "Auto"} ·{" "}
+                        {voice.ref_text
+                          ? `${voice.ref_text.slice(0, 12)}… · ${voice.ref_text.length} 字`
+                          : "无参考文本"}
                       </CardDescription>
                     </div>
                     <Badge tone={voice.has_ref_spk ? "success" : "muted"}>{voice.has_ref_spk ? "已提特征" : "参考音频"}</Badge>
@@ -205,18 +235,28 @@ export default function VoicesPage() {
                       {preparing === voice.id ? <Loader2 className="animate-spin" /> : <Wand2 />}
                       {preparing === voice.id ? "提取中" : "提特征"}
                     </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => openEdit(voice)}
+                      title="修改参考文本，必须与参考音频里说的话逐字一致"
+                    >
+                      <Pencil /> 改文本
+                    </Button>
                     <Button variant="ghost" size="sm" asChild>
                       <a href={api.voiceExportUrl(voice.id)} download>
                         <Download /> 导出
                       </a>
                     </Button>
+                  </div>
+                  <div className="mt-auto flex justify-between items-center">
+                    <p className="text-[10px] text-muted-foreground">
+                      使用 {voice.use_count} 次 · {formatRelative(voice.created_at)}
+                    </p>
                     <Button variant="ghost" size="sm" className="ml-auto text-destructive" onClick={() => remove(voice)}>
                       <Trash2 />
                     </Button>
                   </div>
-                  <p className="text-[10px] text-muted-foreground">
-                    使用 {voice.use_count} 次 · {formatRelative(voice.created_at)}
-                  </p>
                 </CardContent>
               </Card>
             ))}
@@ -297,7 +337,10 @@ export default function VoicesPage() {
           </Field>
         </div>
 
-        <Field label="参考文本（强烈建议填）" hint="音频里说的原话，逐字一致。填了走 ICL 克隆，音色更像。">
+        <Field
+          label="参考文本（强烈建议填）"
+          hint="音频里说的原话，逐字一致。填了走 ICL 克隆，音色更像；超过 30 秒会在停顿处收尾，并同步收敛文本。"
+        >
           <Textarea
             value={refText}
             onChange={(event) => setRefText(event.target.value)}
@@ -313,6 +356,35 @@ export default function VoicesPage() {
           </div>
           <Switch checked={xvecOnly} onCheckedChange={setXvecOnly} />
         </div>
+      </Dialog>
+
+      <Dialog
+        open={Boolean(editTarget)}
+        onOpenChange={(open) => {
+          if (!open) setEditTarget(null);
+        }}
+        title="修改参考文本"
+        description="只填参考音频里真正说出口的那段话，逐字一致。多了、少了都会让模型复读旧内容。"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setEditTarget(null)}>
+              取消
+            </Button>
+            <Button onClick={saveRefText} disabled={savingEdit}>
+              {savingEdit ? <Spinner /> : <Sparkles />} 保存
+            </Button>
+          </>
+        }
+      >
+        <Field label="参考文本" hint="留空则自动改用「仅用说话人特征」（x-vector），不需要文本">
+          <Textarea
+            value={editRefText}
+            onChange={(event) => setEditRefText(event.target.value)}
+            placeholder="参考音频里说的原话"
+            className="min-h-24"
+          />
+        </Field>
+        <p className="text-[11px] text-muted-foreground">当前 {editRefText.trim().length} 字</p>
       </Dialog>
     </div>
   );

@@ -102,7 +102,16 @@ export const api = {
     const qs = search.toString();
     return request<{ items: Voice[]; total: number }>(`/voices${qs ? `?${qs}` : ""}`);
   },
-  createVoice: (form: FormData) => request<{ voice: Voice; duration_s: number; prepared: Record<string, unknown> }>("/voices", { method: "POST", body: form }),
+  createVoice: (form: FormData) =>
+    request<{
+      voice: Voice;
+      duration_s: number;
+      source_duration_s?: number;
+      truncated?: boolean;
+      ref_text_trimmed?: boolean;
+      instruct_ignored?: boolean;
+      prepared: Record<string, unknown>;
+    }>("/voices", { method: "POST", body: form }),
   updateVoice: (id: string, patch: Partial<Voice>) => request<Voice>(`/voices/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
   deleteVoice: (id: string) => request<{ deleted: string }>(`/voices/${id}`, { method: "DELETE" }),
   prepareVoice: (id: string) =>
@@ -131,6 +140,14 @@ export const api = {
   },
   historyRecord: (id: string) => request<HistoryRecord>(`/history/${id}`),
   deleteHistory: (id: string) => request<{ deleted: string }>(`/history/${id}`, { method: "DELETE" }),
+  historyPreview: (before: number) =>
+    request<{ before: number; records: number; audio_files: number; audio_bytes: number; oldest: number | null; newest: number | null }>(
+      `/history/preview?before=${before}`,
+    ),
+  cleanupHistory: (before: number) =>
+    request<{ deleted: number; audio_removed: number; freed_bytes: number }>(`/history?before=${before}`, {
+      method: "DELETE",
+    }),
   regenerate: async (id: string, overrides?: Record<string, unknown>) => {
     const response = await fetch(`${BASE}/history/${id}/regenerate`, {
       method: "POST",

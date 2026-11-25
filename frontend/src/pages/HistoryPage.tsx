@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, Download, Play, RefreshCw, Save, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { ChevronLeft, ChevronRight, Download, Eraser, Play, RefreshCw, Save, Trash2 } from "lucide-react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { PageHeader } from "@/components/Shell";
@@ -11,11 +11,24 @@ import { Badge, Dialog, EmptyState, Spinner } from "@/components/ui/misc";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { api } from "@/lib/api";
 import type { HistoryRecord, Mode } from "@/lib/types";
-import { formatSeconds, formatTime } from "@/lib/utils";
+import { formatBytes, formatSeconds, formatTime } from "@/lib/utils";
 
 const MODE_LABEL: Record<Mode, string> = { custom: "语音生成", design: "声音设计", clone: "音色克隆" };
 const MODE_TONE: Record<Mode, "default" | "success" | "warning"> = { custom: "default", design: "warning", clone: "success" };
 const PAGE_SIZE = 12;
+const CLEANUP_PRESETS = [
+  { value: "7", label: "7 天前" },
+  { value: "30", label: "30 天前" },
+  { value: "90", label: "90 天前" },
+  { value: "365", label: "1 年前" },
+  { value: "custom", label: "指定日期" },
+];
+
+function todayString() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
 
 export default function HistoryPage() {
   const queryClient = useQueryClient();
@@ -27,9 +40,31 @@ export default function HistoryPage() {
   const [voiceName, setVoiceName] = useState("");
   const [busy, setBusy] = useState(false);
 
+  const [cleanupOpen, setCleanupOpen] = useState(false);
+  const [cleanupRange, setCleanupRange] = useState("30");
+  const [cleanupDate, setCleanupDate] = useState("");
+  const [cleaning, setCleaning] = useState(false);
+
   const { data, isLoading } = useQuery({
     queryKey: ["history", page, mode, query],
     queryFn: () => api.history({ page, page_size: PAGE_SIZE, mode: mode === "all" ? undefined : mode, query }),
+  });
+
+  // 清理截止时间：固定成 Unix 秒，预览和实际删除用同一个值
+  const cleanupBefore = useMemo(() => {
+    if (cleanupRange === "custom") {
+      if (!cleanupDate) return null;
+      const ts = Math.floor(new Date(`${cleanupDate}T00:00:00`).getTime() / 1000);
+      return Number.isFinite(ts) ? ts : null;
+    }
+    return Math.floor(Date.now() / 1000) - Number(cleanupRange) * 86400;
+  }, [cleanupRange, cleanupDate]);
+
+  const { data: cleanupPreview } = useQuery({
+    queryKey: ["history-cleanup", cleanupBefore],
+    queryFn: () => api.historyPreview(cleanupBefore as number),
+    enabled: cleanupOpen && cleanupBefore !== null,
+    refetchOnMount: "always",
   });
 
   const refresh = async () => {
@@ -59,6 +94,27 @@ export default function HistoryPage() {
     }
   };
 
+  const runCleanup = async () => {
+    if (!cleanupBefore) {
+      toast.error("请先选择要清理的截止时间");
+      return;
+    }
+    if (!cleanupPreview?.records) return;
+    setCleaning(true);
+    try {
+      const result = await api.cleanupHistory(cleanupBefore);
+      toast.success(`已清理 ${result.deleted} 条记录，释放 ${result.freed_bytes ? formatBytes(result.freed_bytes) : "0 B"}`);
+      setCleanupOpen(false);
+      setPage(1);
+      await refresh();
+      void queryClient.invalidateQueries({ queryKey: ["history-cleanup"] });
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "清理失败");
+    } finally {
+      setCleaning(false);
+    }
+  };
+
   const saveVoice = async () => {
     if (!saveTarget?.audio_url) return;
     setBusy(true);
@@ -71,8 +127,12 @@ export default function HistoryPage() {
       form.append("language", saveTarget.language ?? "Auto");
       form.append("instruct", String((saveTarget.params as { instruct?: string })?.instruct ?? ""));
       form.append("source_history_id", saveTarget.id);
-      await api.createVoice(form);
-      toast.success("已存入音色库");
+      const result = await api.createVoice(form);
+      toast.success(
+        result.truncated
+          ? "已存入音色库（参考音频截为前 30 秒，参考文本同步截断）"
+          : "已存入音色库",
+      );
       setSaveTarget(null);
       setVoiceName("");
       await queryClient.invalidateQueries({ queryKey: ["voices"] });
@@ -93,6 +153,9 @@ export default function HistoryPage() {
         description="每次生成都留档：文本、参数、音频、性能指标"
         action={
           <div className="flex items-center gap-2">
+            <Button variant="outline" size="sm" onClick={() => setCleanupOpen(true)}>
+              <Eraser /> 清理
+            </Button>
             <Input
               value={query}
               onChange={(event) => {
@@ -230,6 +293,81 @@ export default function HistoryPage() {
         <Field label="音色名称">
           <Input value={voiceName} onChange={(event) => setVoiceName(event.target.value)} placeholder="例如：广告男声 v2" />
         </Field>
+      </Dialog>
+
+      <Dialog
+        open={cleanupOpen}
+        onOpenChange={(open) => setCleanupOpen(open)}
+        title="清理历史记录"
+        description="按时间批量删除记录及其音频文件，删除后无法恢复。"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setCleanupOpen(false)}>
+              取消
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={runCleanup}
+              disabled={cleaning || !cleanupPreview?.records}
+            >
+              {cleaning ? <Spinner /> : <Trash2 />} 清理 {cleanupPreview?.records ?? 0} 条
+            </Button>
+          </>
+        }
+      >
+        <Field label="清理范围" hint="该时间点之前生成的记录会被全部删除">
+          <Select value={cleanupRange} onValueChange={setCleanupRange}>
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {CLEANUP_PRESETS.map((preset) => (
+                <SelectItem key={preset.value} value={preset.value}>
+                  {preset.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+
+        {cleanupRange === "custom" ? (
+          <Field label="截止日期" hint="删除这一天 00:00 之前的记录">
+            <Input
+              type="date"
+              value={cleanupDate}
+              max={todayString()}
+              onChange={(event) => setCleanupDate(event.target.value)}
+            />
+          </Field>
+        ) : null}
+
+        <div className="rounded-lg border border-border/70 bg-muted/20 px-3 py-2 text-[11px] leading-relaxed">
+          {cleanupBefore === null ? (
+            <p className="text-muted-foreground">先选一个截止日期。</p>
+          ) : cleanupPreview ? (
+            cleanupPreview.records ? (
+              <div className="space-y-1">
+                <p>
+                  将删除 <span className="font-medium text-foreground">{cleanupPreview.records}</span> 条记录，含{" "}
+                  {cleanupPreview.audio_files} 个音频文件，约释放 {formatBytes(cleanupPreview.audio_bytes)}。
+                </p>
+                <p className="text-muted-foreground">
+                  时间范围：{formatTime(cleanupPreview.oldest)} — {formatTime(cleanupPreview.newest)}
+                </p>
+              </div>
+            ) : (
+              <p className="text-muted-foreground">这个时间点之前没有记录。</p>
+            )
+          ) : (
+            <p className="flex items-center gap-1.5 text-muted-foreground">
+              <Spinner /> 正在统计…
+            </p>
+          )}
+        </div>
+
+        <p className="text-[11px] leading-relaxed text-destructive">
+          音频文件会一并从磁盘删除；最近 1 分钟内的记录不会被清理。
+        </p>
       </Dialog>
     </div>
   );

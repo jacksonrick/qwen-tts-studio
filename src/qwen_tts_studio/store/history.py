@@ -98,6 +98,20 @@ class HistoryRepo:
             )
         return ids
 
+    def pending_before(self, before_ts: int) -> list[dict[str, Any]]:
+        """Records older than `before_ts`, with the audio path so callers can size or unlink it."""
+        return self.db.query(
+            "SELECT id, created_at, audio_path FROM history WHERE created_at < ? ORDER BY created_at ASC",
+            (before_ts,),
+        )
+
+    def delete_before(self, before_ts: int) -> list[dict[str, Any]]:
+        """Delete every record older than `before_ts` and return what was removed."""
+        rows = self.pending_before(before_ts)
+        if rows:
+            self.db.execute("DELETE FROM history WHERE created_at < ?", (before_ts,))
+        return rows
+
     def distinct_modes(self) -> list[str]:
         return [row["mode"] for row in self.db.query("SELECT DISTINCT mode FROM history ORDER BY mode")]
 

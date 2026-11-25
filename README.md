@@ -122,6 +122,7 @@ uv run qwen-tts-studio --backend torch --quant Q8_0   # 临时覆盖后端与量
 2. 生成台切到「音色克隆」，选中该音色即可合成。
 3. 参考文本与音频严格对应时质量最好；勾选「仅用说话人特征」走 x-vector 路径，跨语言更干净，且不需要参考文本。
 4. 音色卡片上的「提特征」会预提取 `.spk` / `.rvq`，克隆时跳过参考编码（需要 Base 模型已下载）。
+5. 参考音频超过 30 秒会在 30 秒前的停顿处收尾（不会把字切一半），参考文本会同步收敛到这段音频能容纳的长度；文本明显比音频长时不再硬合成，而是报 `ref_text_mismatch`——ICL 克隆把参考音频当上下文，文本对不齐就会把旧文稿念出来。没有参考文本的音色会自动改走 x-vector。
 
 > ggml 后端不支持克隆模式下的风格指令（qwentts.cpp 限制），该输入框会自动禁用；需要给克隆加情绪、语速，切到 torch 后端。
 
@@ -132,12 +133,12 @@ uv run qwen-tts-studio --backend torch --quant Q8_0   # 临时覆盖后端与量
 ### 音色库 / 历史 / 系统
 
 - **音色库**：卡片式管理，可试音、提特征、导出 zip、删除；上传支持拖拽与浏览器录音（自动重采样到 24kHz）。
-- **历史**：按模式筛选、按文本搜索，支持试听、再生成（同参数重跑）、存为音色、下载原始 WAV。
+- **历史**：按模式筛选、按文本搜索，支持试听、再生成（同参数重跑）、存为音色、下载原始 WAV；「清理」可按 7/30/90 天或指定日期批量删除记录与音频（先预览条数与占用空间，最近 1 分钟内的记录不会被删）。
 - **系统**：运行环境、模型矩阵、队列与自检、日志弹窗、默认参数（后端 / 量化 / 分段步长 / 队列上限 / 采样参数 / 常驻与鉴权开关）。
 
 ## HTTP API
 
-完整定义见运行中的 `/docs`（Swagger）或 `/openapi.json`，应用内「API」页有可复制的示例。
+完整定义见运行中的 `/docs`（Swagger）或 `/openapi.json`；应用内「API」页按功能分组列出全部端点，可展开查看**逐个参数（位置 / 类型 / 必填 / 默认 / 说明）**、响应头与错误码，并复制 curl / Python 示例。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -146,14 +147,18 @@ uv run qwen-tts-studio --backend torch --quant Q8_0   # 临时覆盖后端与量
 | WS | `/api/v1/ws/tts` | 流式双向：JSON 文本帧 + 二进制 PCM 帧，可随时发 `{"type":"cancel"}` |
 | POST | `/api/v1/tts/cancel/{job_id}` | HTTP 侧取消 |
 | GET | `/api/v1/jobs/{job_id}` | 任务状态与统计 |
+| GET | `/api/v1/speakers` · `/languages` | 内置说话人 / 语言列表 |
 | GET | `/api/v1/voices` · `POST` | 音色列表 / 上传（multipart） |
 | PATCH · DELETE | `/api/v1/voices/{id}` | 改名、删除 |
 | GET | `/api/v1/voices/{id}/audio` · `/export` | 原声 / zip 导出 |
 | POST | `/api/v1/voices/{id}/sample` · `/prepare` | 试音 / 预提取参考特征 |
 | GET | `/api/v1/history` | 分页列表（`page` / `page_size` / `mode` / `query`） |
+| GET · DELETE | `/api/v1/history` | `DELETE ?before=<unix秒>` 按时间批量清理记录与音频 |
+| GET | `/api/v1/history/preview` | 清理预览：`?before=<unix秒>` 返回条数、音频数、占用字节 |
 | GET | `/api/v1/history/{id}` · `/audio` · `/download` | 详情 / 音频（支持 Range）/ 下载 |
 | POST | `/api/v1/history/{id}/regenerate` | 同参数重新生成 |
 | GET | `/api/v1/system/info` · `/models` · `/queue` | 运行环境、模型矩阵、队列 |
+| GET | `/api/v1/health` · `/version` | 健康检查 / 版本（免鉴权） |
 | POST | `/api/v1/system/models/load` · `/unload` · `/selftest` | 加载 / 卸载 / 自检 |
 | GET | `/api/v1/system/models/download` | SSE 下载进度 |
 | GET · DELETE | `/api/v1/system/logs` | 读取尾部 / 清空日志 |
